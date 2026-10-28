@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-hudmod-project">
+    <comment>HudMod project</comment>
+    <icon name="application-x-hudmod-project"/>
+    <generic-icon name="video-x-generic"/>
+    <glob pattern="project.res" weight="100" case-sensitive="true"/>
+  </mime-type>
+</mime-info>

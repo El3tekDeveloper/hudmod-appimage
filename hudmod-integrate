@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# HudMod AppImage desktop integration
+#   hudmod-integrate install     copy the AppImage, add menu entry, icon, project.res association
+#   hudmod-integrate uninstall   remove all of the above (keeps your projects and settings)
+#   hudmod-integrate first-run   ask once, then install (called by AppRun)
+
+set -u
+
+VERSION="1.0.0-alpha.2"
+HERE="$(dirname "$(readlink -f "$0")")/../.."
+HERE="$(readlink -f "$HERE")"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+BIN_DIR="$HOME/.local/bin"
+INSTALL_DIR="$HOME/.local/opt/hudmod"
+INSTALLED_APPIMAGE="$INSTALL_DIR/HudMod.AppImage"
+DESKTOP_FILE="$DATA_HOME/applications/hudmod.desktop"
+MIME_FILE="$DATA_HOME/mime/packages/hudmod-project.xml"
+STATE_DIR="$CONFIG_HOME/hudmod-appimage"
+MIME_TYPE="application/x-hudmod-project"
+ICON_SIZES="16 32 48 64 128 256 512"
+ALL_ICON_SIZES="16 22 24 32 48 64 96 128 192 256 512"   # cleaned up on (re)install/uninstall
+
+say() { echo "[hudmod] $*"; }
+
+refresh_caches() {
+    command -v update-mime-database   >/dev/null 2>&1 && update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1
+    command -v gtk-update-icon-cache  >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$DATA_HOME/icons/hicolor" >/dev/null 2>&1
+    command -v kbuildsycoca6 >/dev/null 2>&1 && kbuildsycoca6 >/dev/null 2>&1
+    command -v kbuildsycoca5 >/dev/null 2>&1 && kbuildsycoca5 >/dev/null 2>&1
+    true
+}
+
+# Every .desktop file for HudMod the user has: by file name, Name=, Exec= or Icon=.
+find_hudmod_desktop_entries() {
+    local dirs=("$DATA_HOME/applications")
+    local desk
+    desk="$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP 2>/dev/null)"
+    [ -n "$desk" ] && [ "$desk" != "$HOME" ] && dirs+=("$desk")
+    [ -d "$HOME/Desktop" ] && dirs+=("$HOME/Desktop")
+    for d in "${dirs[@]}"; do
+        [ -d "$d" ] || continue
+        find "$d" -maxdepth 2 -type f -name '*.desktop' 2>/dev/null | while IFS= read -r f; do
+            if [[ "$(basename "$f")" == *[Hh][Uu][Dd][Mm][Oo][Dd]* ]] ||
+               grep -qiE '^(Name|Exec|TryExec|Icon)=.*hud[ _-]?mod' "$f" 2>/dev/null; then
+                printf '%s\n' "$f"
+            fi
+        done
+    done | sort -u
+}
+
+remove_old_desktop_entries() {
+    local f n=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        rm -f "$f" && say "Removed old entry $f" && n=$((n+1))
+    done < <(find_hudmod_desktop_entries)
+    if [ -f "$CONFIG_HOME/mimeapps.list" ]; then
+        # drop associations that pointed at the removed entries
+        sed -i -E '/=[^=;]*[Hh][Uu][Dd][Mm][Oo][Dd][^=;]*\.desktop;?$/d' "$CONFIG_HOME/mimeapps.list"
+    fi
+    for f in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
+        [ -f "$f" ] || continue
+        if [[ "$(basename "$f")" == *[Hh][Uu][Dd][Mm][Oo][Dd]* ]] || grep -qiE '^(Name|Exec)=.*hud[ _-]?mod' "$f" 2>/dev/null; then
+            say "Note: system-wide entry $f needs root to remove:  sudo rm '$f'"
+        fi
+    done
+    true
+}
+
+remove_icons() {
+    for s in $ALL_ICON_SIZES; do
+        rm -f "$DATA_HOME/icons/hicolor/${s}x${s}/apps/hudmod.png" \
+              "$DATA_HOME/icons/hicolor/${s}x${s}/mimetypes/application-x-hudmod-project.png"
+    done
+}
+
+# Remove every existing HudMod .desktop entry (older installs, appimaged/AppImageLauncher
+# generated ones, desktop shortcuts) so only the new one remains.
+remove_old_desktop_files() {
+    local dirs=(
+        "$DATA_HOME/applications"
+        "$HOME/.local/share/applications"
+        "$HOME/Desktop"
+        "$(command -v xdg-user-dir >/dev/null 2>&1 && xdg-user-dir DESKTOP 2>/dev/null)"
+    )
+    local d f removed=0
+    for d in "${dirs[@]}"; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        while IFS= read -r -d '' f; do
+            # match by filename, or by content (Name=/Exec= mentioning HudMod)
+            if [[ "$(basename "$f")" == *[Hh]ud[Mm]od* ]] || \
+               grep -qiE '^(Name|Exec|TryExec|Icon|StartupWMClass)=.*hudmod' "$f" 2>/dev/null; then
+                rm -f "$f" && say "Removed old entry $f" && removed=1
+            fi
+        done < <(find "$d" -maxdepth 2 -type f -name '*.desktop' -print0 2>/dev/null)
+    done
+    # System-wide entries need root; report rather than touch them.
+    for f in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
+        [ -f "$f" ] || continue
+        if [[ "$(basename "$f")" == *[Hh]ud[Mm]od* ]] || grep -qiE '^(Name|Exec)=.*hudmod' "$f" 2>/dev/null; then
+            say "System-wide entry found (needs root to remove): sudo rm '$f'"
+        fi
+    done
+    # drop stale default-app lines pointing at removed entries
+    if [ "$removed" = 1 ] && [ -f "$CONFIG_HOME/mimeapps.list" ]; then
+        sed -i "\|^$MIME_TYPE=|d" "$CONFIG_HOME/mimeapps.list"
+    fi
+    true
+}
+
+do_install() {
+    local src="${APPIMAGE:-}"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        echo "Run this from the AppImage:  ./HudMod-alpha.2-x86_64.AppImage --install" >&2
+        exit 1
+    fi
+
+    # 0. Clear out any previous HudMod menu entries
+    remove_old_desktop_files
+
+    # 1. The app itself
+    mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+    if [ "$(readlink -f "$src")" != "$(readlink -f "$INSTALLED_APPIMAGE" 2>/dev/null)" ]; then
+        cp -f "$src" "$INSTALLED_APPIMAGE.tmp" && mv -f "$INSTALLED_APPIMAGE.tmp" "$INSTALLED_APPIMAGE"
+    fi
+    chmod +x "$INSTALLED_APPIMAGE"
+    echo "$VERSION" > "$INSTALL_DIR/VERSION"
+    say "Installed  $INSTALLED_APPIMAGE"
+
+    # 2. Command-line launcher:  hudmod [project.res | project folder]
+    cat > "$BIN_DIR/hudmod" <<EOF
+#!/usr/bin/env bash
+exec "$INSTALLED_APPIMAGE" --no-integrate "\$@"
+EOF
+    chmod +x "$BIN_DIR/hudmod"
+    say "Command    $BIN_DIR/hudmod"
+
+    # 3. Remove any existing HudMod .desktop entries (older installs, AppImageLauncher, manual ones)
+    remove_old_desktop_entries
+
+    # 4. Icons (app + project file type) — drop old ones first so no stale size wins
+    remove_icons
+    for s in $ICON_SIZES; do
+        local f="$HERE/usr/share/icons/hicolor/${s}x${s}/apps/hudmod.png"
+        [ -f "$f" ] || continue
+        install -Dm644 "$f" "$DATA_HOME/icons/hicolor/${s}x${s}/apps/hudmod.png"
+        install -Dm644 "$f" "$DATA_HOME/icons/hicolor/${s}x${s}/mimetypes/application-x-hudmod-project.png"
+    done
+
+    # 5. MIME type for project.res
+    install -Dm644 "$HERE/usr/share/mime/packages/hudmod-project.xml" "$MIME_FILE"
+
+    # 6. Menu entry
+    mkdir -p "$(dirname "$DESKTOP_FILE")"
+    sed "s|@APPIMAGE@|$INSTALLED_APPIMAGE|g" "$HERE/usr/share/hudmod/hudmod.desktop.in" > "$DESKTOP_FILE"
+    chmod 644 "$DESKTOP_FILE"
+    say "Menu entry $DESKTOP_FILE"
+
+    refresh_caches
+
+    # 7. Make HudMod the default app for project.res
+    command -v xdg-mime >/dev/null 2>&1 && xdg-mime default hudmod.desktop "$MIME_TYPE" >/dev/null 2>&1
+    say "project.res files now open in HudMod"
+
+    mkdir -p "$STATE_DIR" && echo "$VERSION" > "$STATE_DIR/integrated"
+    rm -f "$STATE_DIR/declined"
+
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) say "Note: $BIN_DIR is not on your PATH, so the 'hudmod' command needs its full path." ;;
+    esac
+}
+
+do_uninstall() {
+    remove_old_desktop_files
+    rm -f "$DESKTOP_FILE" "$MIME_FILE" "$BIN_DIR/hudmod"
+    remove_old_desktop_entries
+    remove_icons
+    rm -rf "$INSTALL_DIR" "$STATE_DIR"
+    if [ -f "$CONFIG_HOME/mimeapps.list" ]; then
+        sed -i "\|^$MIME_TYPE=hudmod.desktop;\?$|d" "$CONFIG_HOME/mimeapps.list"
+    fi
+    refresh_caches
+    say "HudMod integration removed. Your projects and editor settings in"
+    say "  $DATA_HOME/HudMod Video Editor/  were left untouched."
+}
+
+ask_yes_no() {
+    local msg="$1"
+    if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        zenity --question --title="Install HudMod" --icon-name=hudmod --width=420 --text="$msg" 2>/dev/null
+        return $?
+    elif command -v kdialog >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        kdialog --title "Install HudMod" --yesno "$msg" 2>/dev/null
+        return $?
+    elif [ -t 0 ]; then
+        printf '%s [Y/n] ' "$msg"
+        local r; read -r r
+        case "$r" in [nN]*) return 1 ;; *) return 0 ;; esac
+    fi
+    return 0   # no way to ask: install (that's what this AppImage is for)
+}
+
+do_first_run() {
+    # Already integrated with this version, or the user said no before.
+    [ "$(cat "$STATE_DIR/integrated" 2>/dev/null)" = "$VERSION" ] && [ -x "$INSTALLED_APPIMAGE" ] && return 0
+    [ -f "$STATE_DIR/declined" ] && return 0
+
+    if ask_yes_no "Install HudMod $VERSION?
+
+This adds HudMod to your applications menu and makes project.res files open in HudMod when you double-click them.
+
+You can undo this anytime with:  HudMod.AppImage --uninstall"; then
+        do_install
+    else
+        mkdir -p "$STATE_DIR" && touch "$STATE_DIR/declined"
+    fi
+}
+
+case "${1:-}" in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    first-run) do_first_run ;;
+    *) echo "usage: $0 install|uninstall|first-run" >&2; exit 2 ;;
+esac

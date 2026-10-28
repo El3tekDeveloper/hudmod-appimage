@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# HudMod 1.0.0-alpha.2 — AppImage launcher
+#
+# Usage:
+#   HudMod.AppImage                        start HudMod (version panel)
+#   HudMod.AppImage /path/to/project.res   open that project
+#   HudMod.AppImage /path/to/ProjectDir    open the project in that folder
+#   HudMod.AppImage --install              install: menu entry, icon, project.res association
+#   HudMod.AppImage --uninstall            remove everything --install created
+#   HudMod.AppImage --no-integrate ...     run without the first-run install prompt
+#
+# How HudMod opens a project (EditorServer.gd, _ready):
+#   launch_args = OS.get_cmdline_user_args()
+#   launch_project_path = launch_args[0]            -> the project *folder*
+#   if FileAccess.file_exists(launch_project_path/"project.res"):
+#       ProjectServer2.open_project(launch_project_path)
+# get_cmdline_user_args() only returns what comes after "--", so we pass:
+#   HudMod.x86_64 -- "<project folder>"
+
+set -u
+
+HERE="$(dirname "$(readlink -f "${0}")")"
+APP_BIN="$HERE/usr/lib/hudmod/HudMod.x86_64"
+
+export LD_LIBRARY_PATH="$HERE/usr/lib/hudmod${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Resolve whatever we were given (file, folder or file:// URI) to a project folder.
+resolve_project_dir() {
+    local p="$1"
+    case "$p" in
+        file://*)
+            p="${p#file://}"
+            p="${p#localhost}"
+            # percent-decode (spaces, unicode, etc.)
+            p="$(printf '%b' "${p//%/\\x}")"
+            ;;
+    esac
+    [ -e "$p" ] || return 1
+    p="$(readlink -f "$p")"
+    if [ -d "$p" ]; then
+        [ -f "$p/project.res" ] || return 1
+        printf '%s' "$p"
+    elif [ "$(basename "$p")" = "project.res" ]; then
+        dirname "$p"
+    else
+        return 1
+    fi
+}
+
+notify_err() {
+    echo "HudMod: $1" >&2
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -i hudmod "HudMod" "$1" 2>/dev/null || true
+    fi
+}
+
+INTEGRATE=1
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --install)      exec "$HERE/usr/bin/hudmod-integrate" install ;;
+        --uninstall)    exec "$HERE/usr/bin/hudmod-integrate" uninstall ;;
+        --no-integrate) INTEGRATE=0 ;;
+        *)              ARGS+=("$a") ;;
+    esac
+done
+
+# First run from an AppImage: offer to install the menu entry + file association.
+if [ "$INTEGRATE" = 1 ] && [ -n "${APPIMAGE:-}" ]; then
+    "$HERE/usr/bin/hudmod-integrate" first-run || true
+fi
+
+if [ "${#ARGS[@]}" -eq 0 ]; then
+    exec "$APP_BIN"
+fi
+
+FIRST="${ARGS[0]}"
+case "$FIRST" in
+    -*)
+        # Raw Godot/engine flags: pass straight through.
+        exec "$APP_BIN" "${ARGS[@]}"
+        ;;
+esac
+
+if PROJECT_DIR="$(resolve_project_dir "$FIRST")"; then
+    exec "$APP_BIN" -- "$PROJECT_DIR"
+fi
+
+notify_err "Not a HudMod project: $FIRST (expected a project.res file or a folder that contains one). Starting HudMod normally."
+exec "$APP_BIN"

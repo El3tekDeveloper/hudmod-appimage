@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=HudMod
+GenericName=Video Editor
+Comment=Open-source real-time video editor
+Exec="@APPIMAGE@" --no-integrate %f
+TryExec=@APPIMAGE@
+Icon=hudmod
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=application/x-hudmod-project;
+Keywords=video;editor;editing;timeline;hudmod;
+StartupWMClass=HudMod
